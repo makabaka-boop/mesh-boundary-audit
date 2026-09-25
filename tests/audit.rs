@@ -6,11 +6,16 @@
 //! hard parse rejections (unknown vertex, duplicate undirected face, extra
 //! fields and friends).
 
-use meshcheck::{analyze, EdgeFault, Report};
+use meshcheck::{analyze, analyze_boundary, EdgeFault, Report};
 
 fn analyze_fixture(name: &str) -> Report {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/");
     analyze(&std::fs::read_to_string(format!("{path}{name}")).unwrap())
+}
+
+fn analyze_boundary_fixture(name: &str) -> Report {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/");
+    analyze_boundary(&std::fs::read_to_string(format!("{path}{name}")).unwrap())
 }
 
 // ---------- legal closed bodies ------------------------------------------
@@ -59,6 +64,102 @@ fn connected_sum_of_two_tori_has_genus_two() {
     );
 }
 
+// ---------- legal boundary surfaces ---------------------------------------
+
+#[test]
+fn disk_reports_one_induced_boundary_loop_and_genus_zero() {
+    assert_eq!(
+        analyze_boundary_fixture("boundary.mesh"),
+        Report::BoundaryOk {
+            vertices: 5,
+            edges: 9,
+            faces: 5,
+            euler: 1,
+            genus: 0,
+            boundary_loops: vec![vec!["a".into(), "b".into(), "t".into()]],
+        }
+    );
+}
+
+#[test]
+fn annulus_reports_two_canonical_loops_covering_every_boundary_edge() {
+    let report = analyze_boundary_fixture("annulus.mesh");
+    let Report::BoundaryOk {
+        vertices,
+        edges,
+        faces,
+        euler,
+        genus,
+        boundary_loops,
+    } = report
+    else {
+        panic!("expected boundary-ok, got {report:?}");
+    };
+
+    assert_eq!((vertices, edges, faces, euler, genus), (6, 9, 6, 3, 0));
+    assert_eq!(
+        boundary_loops,
+        vec![
+            vec!["a".into(), "b".into(), "c".into()],
+            vec!["d".into(), "f".into(), "e".into()],
+        ]
+    );
+
+    let covered: std::collections::BTreeSet<[String; 2]> = boundary_loops
+        .iter()
+        .flat_map(|loop_vertices| {
+            let mut edges = Vec::new();
+            for i in 0..loop_vertices.len() {
+                edges.push([
+                    loop_vertices[i].clone(),
+                    loop_vertices[(i + 1) % loop_vertices.len()].clone(),
+                ]);
+            }
+            edges
+        })
+        .collect();
+    assert_eq!(
+        covered,
+        [
+            ["a", "b"],
+            ["b", "c"],
+            ["c", "a"],
+            ["d", "f"],
+            ["f", "e"],
+            ["e", "d"],
+        ]
+        .into_iter()
+        .map(|edge| [edge[0].into(), edge[1].into()])
+        .collect()
+    );
+}
+
+#[test]
+fn closed_body_is_also_valid_in_boundary_mode_with_zero_loops() {
+    assert_eq!(
+        analyze_boundary_fixture("tet.mesh"),
+        Report::BoundaryOk {
+            vertices: 4,
+            edges: 6,
+            faces: 4,
+            euler: 2,
+            genus: 0,
+            boundary_loops: vec![],
+        }
+    );
+}
+
+#[test]
+fn torn_aperture_has_two_path_links_at_shared_vertex() {
+    assert_eq!(
+        analyze_boundary_fixture("torn-aperture.mesh"),
+        Report::VertexFailed {
+            id: "a".into(),
+            sectors: 2,
+        }
+    );
+}
+
 // ---------- edge stage -----------------------------------------------------
 
 #[test]
@@ -67,6 +168,19 @@ fn flipped_face_witnesses_smallest_same_direction_edge() {
     // lexicographically smallest.
     assert_eq!(
         analyze_fixture("flipped.mesh"),
+        Report::EdgeFailed(meshcheck::EdgeFailure {
+            a: "a".into(),
+            b: "b".into(),
+            uses: 2,
+            fault: EdgeFault::Misoriented,
+        })
+    );
+}
+
+#[test]
+fn flipped_face_still_fails_at_edge_stage_in_boundary_mode() {
+    assert_eq!(
+        analyze_boundary_fixture("flipped.mesh"),
         Report::EdgeFailed(meshcheck::EdgeFailure {
             a: "a".into(),
             b: "b".into(),
@@ -101,6 +215,14 @@ fn edge_shared_by_three_faces_is_nonmanifold() {
     }
 }
 
+#[test]
+fn edge_shared_by_three_faces_remains_nonmanifold_with_boundaries() {
+    assert!(matches!(
+        analyze_boundary_fixture("nonmanifold-edge.mesh"),
+        Report::EdgeFailed(f) if f.a == "a" && f.b == "b" && f.fault == EdgeFault::Nonmanifold
+    ));
+}
+
 // ---------- vertex-sector stage -------------------------------------------
 
 #[test]
@@ -109,6 +231,17 @@ fn two_shells_sharing_one_vertex_pin_two_sectors_at_that_vertex() {
     // link of the shared vertex a is two disjoint cycles.
     assert_eq!(
         analyze_fixture("two-shells-shared-vertex.mesh"),
+        Report::VertexFailed {
+            id: "a".into(),
+            sectors: 2,
+        }
+    );
+}
+
+#[test]
+fn shared_vertex_double_shell_remains_failed_in_boundary_mode() {
+    assert_eq!(
+        analyze_boundary_fixture("two-shells-shared-vertex.mesh"),
         Report::VertexFailed {
             id: "a".into(),
             sectors: 2,
@@ -136,6 +269,32 @@ f b d c
             sectors: 0,
         }
     );
+}
+
+#[test]
+fn isolated_vertex_and_disconnectivity_remain_failures_in_boundary_mode() {
+    let isolated = "\
+v a
+v b
+v c
+v d
+v lonely
+f a b c
+f a c d
+f a d b
+f b d c
+";
+    assert_eq!(
+        analyze_boundary(isolated),
+        Report::VertexFailed {
+            id: "lonely".into(),
+            sectors: 0,
+        }
+    );
+    assert!(matches!(
+        analyze_boundary_fixture("disjoint-shells.mesh"),
+        Report::ComponentFailed { id } if id == "e"
+    ));
 }
 
 // ---------- global-connectivity stage -------------------------------------

@@ -1,13 +1,13 @@
 //! Command-line front end for the meshcheck topology auditor.
 //!
 //! Usage:
-//!   meshcheck [FILE]      audit FILE; with no FILE (or `-`) read stdin
-//!   meshcheck --help      show help
+//!   meshcheck [--boundary] [FILE]  audit FILE; with no FILE (or `-`) read stdin
+//!   meshcheck --help               show help
 
 use std::io::Read;
 use std::process::ExitCode;
 
-use meshcheck::{EdgeFault, Reject, Report};
+use meshcheck::{AuditMode, EdgeFault, Reject, Report};
 
 fn reject_kind(r: &Reject) -> &'static str {
     match r {
@@ -22,6 +22,18 @@ fn reject_kind(r: &Reject) -> &'static str {
         Reject::BadVertexCount { .. } => "bad_vertex_count",
         Reject::BadFaceCount { .. } => "bad_face_count",
     }
+}
+
+fn append_basic(
+    out: &mut String,
+    vertices: usize,
+    edges: usize,
+    faces: usize,
+    euler: i64,
+) {
+    out.push_str(&format!(
+        " V={vertices} E={edges} F={faces} chi={euler}"
+    ));
 }
 
 fn render(report: &Report) -> String {
@@ -72,7 +84,44 @@ fn render(report: &Report) -> String {
             faces,
             euler,
             genus,
-        } => format!("ok V={vertices} E={edges} F={faces} chi={euler} genus={genus}"),
+        } => {
+            let mut out = "ok".to_string();
+            append_basic(&mut out, *vertices, *edges, *faces, *euler);
+            out.push_str(&format!(" genus={genus}"));
+            out
+        }
+        Report::BoundaryOk {
+            vertices,
+            edges,
+            faces,
+            euler,
+            genus,
+            boundary_loops,
+        } => {
+            let mut out = "boundary-ok".to_string();
+            append_basic(&mut out, *vertices, *edges, *faces, *euler);
+            out.push_str(&format!(
+                " boundaries={} genus={genus}",
+                boundary_loops.len()
+            ));
+            for loop_vertices in boundary_loops {
+                out.push_str(" loop=");
+                out.push_str(&loop_vertices.join(","));
+            }
+            out
+        }
+        Report::InvariantFailed {
+            vertices,
+            edges,
+            faces,
+            euler,
+            boundary_loops,
+        } => {
+            let mut out = "invariant-fail".to_string();
+            append_basic(&mut out, *vertices, *edges, *faces, *euler);
+            out.push_str(&format!(" boundaries={}", boundary_loops.len()));
+            out
+        }
     }
 }
 
@@ -81,24 +130,43 @@ fn main() -> ExitCode {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("meshcheck — combinatorial topology auditor for triangle meshes");
         println!();
-        println!("Usage: meshcheck [FILE]");
-        println!("  FILE  mesh document; omit or use '-' to read standard input");
+        println!("Usage: meshcheck [--boundary] [FILE]");
+        println!("  FILE        mesh document; omit or use '-' to read standard input");
+        println!("  --boundary  accept one-face edges and list their boundary loops");
+        println!("  -b          shorthand for --boundary");
         println!();
         println!("Document grammar (one record per line, '#' starts a comment):");
         println!("  v <id>                      declare a vertex");
         println!("  f <id> <id> <id>            directed triangle (CCW order)");
         println!();
-        println!("Audit priority: edge conditions, then per-vertex fan sectors,");
-        println!("then global face connectivity. Exit code: 0 valid, 1 rejected,");
-        println!("2 edge failure, 3 vertex failure, 4 disconnected, 3 usage error.");
-        return ExitCode::from(3);
-    }
-    if args.len() > 1 {
-        eprintln!("meshcheck: expected at most one FILE argument");
+        println!("Default mode is closed: every edge must have two opposite face uses.");
+        println!("Boundary mode also permits one use; three or more or same-direction");
+        println!("edges still fail. Audit priority: edge conditions, per-vertex links,");
+        println!("then face connectivity. Exit code: 0 valid, 1 rejected, 2 edge");
+        println!("failure, 3 vertex failure, 4 disconnected, 5 invariant failure,");
+        println!("3 usage error.");
         return ExitCode::from(3);
     }
 
-    let input = match args.first().map(String::as_str) {
+    let mut mode = AuditMode::Closed;
+    let mut path: Option<&str> = None;
+    for arg in &args {
+        match arg.as_str() {
+            "--boundary" | "-b" => mode = AuditMode::Boundary,
+            "-" if path.is_none() => path = Some("-"),
+            arg if arg.starts_with('-') && arg != "-" => {
+                eprintln!("meshcheck: unknown option: {arg}");
+                return ExitCode::from(3);
+            }
+            _ if path.is_none() => path = Some(arg),
+            _ => {
+                eprintln!("meshcheck: expected at most one FILE argument");
+                return ExitCode::from(3);
+            }
+        }
+    }
+
+    let input = match path {
         None | Some("-") => {
             let mut buf = String::new();
             if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -116,13 +184,14 @@ fn main() -> ExitCode {
         },
     };
 
-    let report = meshcheck::analyze(&input);
+    let report = meshcheck::analyze_with(&input, mode);
     println!("{}", render(&report));
     match report {
-        Report::Ok { .. } => ExitCode::SUCCESS,
+        Report::Ok { .. } | Report::BoundaryOk { .. } => ExitCode::SUCCESS,
         Report::Rejected(_) => ExitCode::from(1),
         Report::EdgeFailed(_) => ExitCode::from(2),
         Report::VertexFailed { .. } => ExitCode::from(3),
         Report::ComponentFailed { .. } => ExitCode::from(4),
+        Report::InvariantFailed { .. } => ExitCode::from(5),
     }
 }

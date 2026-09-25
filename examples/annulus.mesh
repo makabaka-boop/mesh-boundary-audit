@@ -1,0 +1,14 @@
+# Triangulated annulus: two boundary loops a-b-c and d-f-e.
+# Induced outer direction is a->b->c->a and inner direction d->f->e->d.
+v a
+v b
+v c
+v d
+v e
+v f
+f a b d
+f b e d
+f b c e
+f c f e
+f c a f
+f a d f

@@ -1,0 +1,18 @@
+# Two triangular disks with separate apertures, pinched together only at a.
+# Every edge is locally manifold, but the link of a has two disjoint paths.
+v a
+v b
+v c
+v t
+v u
+v p
+v q
+v r
+f b c t
+f c a t
+f a u b
+f b u c
+f c u a
+f a q r
+f a r p
+f p r q

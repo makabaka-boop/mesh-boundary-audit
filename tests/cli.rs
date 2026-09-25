@@ -19,6 +19,19 @@ fn run_file(name: &str) -> (String, i32) {
     )
 }
 
+fn run_file_with_boundary(name: &str) -> (String, i32) {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/");
+    let out = Command::new(bin())
+        .arg("--boundary")
+        .arg(format!("{path}{name}"))
+        .output()
+        .expect("meshcheck binary runs");
+    (
+        String::from_utf8(out.stdout).unwrap().trim().to_string(),
+        out.status.code().unwrap(),
+    )
+}
+
 #[test]
 fn valid_tet_prints_invariants_and_exits_zero() {
     assert_eq!(
@@ -36,6 +49,41 @@ fn boundary_exits_two_with_edge_failure_line() {
     assert_eq!(
         run_file("boundary.mesh"),
         ("edge-fail edge=a-b uses=1 fault=boundary".to_string(), 2)
+    );
+}
+
+#[test]
+fn boundary_mode_prints_shared_loop_result_for_disk() {
+    assert_eq!(
+        run_file_with_boundary("boundary.mesh"),
+        (
+            "boundary-ok V=5 E=9 F=5 chi=1 boundaries=1 genus=0 loop=a,b,t".to_string(),
+            0
+        )
+    );
+}
+
+#[test]
+fn boundary_mode_lists_two_annulus_loops() {
+    assert_eq!(
+        run_file_with_boundary("annulus.mesh"),
+        (
+            "boundary-ok V=6 E=9 F=6 chi=3 boundaries=2 genus=0 loop=a,b,c loop=d,f,e"
+                .to_string(),
+            0
+        )
+    );
+}
+
+#[test]
+fn boundary_mode_preserves_edge_and_vertex_failures() {
+    assert_eq!(
+        run_file_with_boundary("flipped.mesh"),
+        ("edge-fail edge=a-b uses=2 fault=misoriented".to_string(), 2)
+    );
+    assert_eq!(
+        run_file_with_boundary("torn-aperture.mesh"),
+        ("vertex-fail vertex=a sectors=2".to_string(), 3)
     );
 }
 
