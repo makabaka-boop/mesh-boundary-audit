@@ -1,0 +1,11 @@
+# Triangulated disc (boundary mode): a rim a-b-c-d capped by a fan of
+# four triangles around center o. Exactly one boundary loop a-b-c-d.
+v a
+v b
+v c
+v d
+v o
+f o a b
+f o b c
+f o c d
+f o d a

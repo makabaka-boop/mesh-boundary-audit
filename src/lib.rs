@@ -1,11 +1,22 @@
 //! meshcheck — combinatorial topology auditor for directed triangle soups.
 //!
-//! The audit proves exactly one property: that the input is a
-//! *combinatorially watertight* orientable triangle mesh — every undirected
-//! edge is used by exactly two faces with opposite directions, the faces
-//! around every vertex form a single fan (a cyclic link), and the face
-//! complex is connected. It does **not** inspect coordinates and therefore
-//! cannot detect geometric self-intersection or degenerate embedding.
+//! Two audit modes share the same stage pipeline:
+//!
+//! * [`AuditMode::Closed`] (via [`analyze`], the default) proves the input is
+//!   a *combinatorially watertight* orientable **closed** triangle mesh —
+//!   every undirected edge is used by exactly two faces with opposite
+//!   directions, the faces around every vertex form a single fan (a cyclic
+//!   link), and the face complex is connected.
+//! * [`AuditMode::Boundary`] (via [`analyze_with_boundary`]) additionally
+//!   accepts a compact surface with holes: an edge may be used by exactly one
+//!   face (a boundary edge). Two faces sharing an edge must still traverse it
+//!   in opposite directions, and three or more uses still fail. Every vertex
+//!   link must be one simple path (boundary vertex) or one cycle (interior
+//!   vertex); forks, multiple sectors and isolated vertices still fail. On
+//!   success the induced, mutually disjoint boundary loops are reported.
+//!
+//! Neither mode inspects coordinates and therefore neither can detect
+//! geometric self-intersection or degenerate embedding.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,10 +51,21 @@ pub enum Reject {
     BadFaceCount { count: usize },
 }
 
+/// Which class of surfaces an audit accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditMode {
+    /// Every edge must be used by exactly two oppositely directed faces.
+    #[default]
+    Closed,
+    /// Edges used by exactly one face are accepted as boundary edges.
+    Boundary,
+}
+
 /// The kind of failure found while auditing undirected edges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EdgeFault {
-    /// The edge belongs to only one directed face (a mesh boundary).
+    /// The edge belongs to only one directed face (a mesh boundary);
+    /// legal only in [`AuditMode::Boundary`].
     Boundary,
     /// The edge occurs twice but in the same direction (a flipped face),
     /// or its two occurrences cannot be paired oppositely.
@@ -83,6 +105,27 @@ pub enum Report {
         faces: usize,
         euler: i64,
         genus: u32,
+    },
+    /// Boundary mode succeeded: a connected orientable compact surface with
+    /// `boundary.len()` holes. `boundary` is the canonical list of boundary
+    /// loops; the loops are mutually vertex- and edge-disjoint.
+    BoundaryOk {
+        vertices: usize,
+        edges: usize,
+        faces: usize,
+        euler: i64,
+        genus: u32,
+        boundary: Vec<Vec<String>>,
+    },
+    /// Boundary mode passed the combinatorial stages but the surface
+    /// identity χ = 2 − 2g − b has no non-negative integer solution for g.
+    /// The audit never claims success in that case.
+    TopologyFailed {
+        vertices: usize,
+        edges: usize,
+        faces: usize,
+        euler: i64,
+        boundary_count: usize,
     },
 }
 
@@ -250,12 +293,9 @@ fn undirected(u: &str, v: &str) -> (String, String) {
     }
 }
 
-/// Stage 1: every undirected edge must be used by exactly two directed
-/// faces, and the two uses must traverse it in opposite directions.
-///
-/// The witness is the lexicographically smallest faulty undirected edge
-/// (ordered by smaller endpoint id, then larger).
-pub fn audit_edges(mesh: &Mesh) -> Result<(), EdgeFailure> {
+/// undirected edge -> counts of traversal in each direction (lexicographic
+/// then reverse), in lexicographic undirected-edge order.
+fn edge_uses(mesh: &Mesh) -> BTreeMap<(String, String), [usize; 2]> {
     // undirected edge -> counts of traversal in each direction
     let mut seen: BTreeMap<(String, String), [usize; 2]> = BTreeMap::new();
     for face in &mesh.faces {
@@ -271,10 +311,28 @@ pub fn audit_edges(mesh: &Mesh) -> Result<(), EdgeFailure> {
             entry[dir] += 1;
         }
     }
+    seen
+}
 
-    for ((a, b), dirs) in seen {
+/// Stage 1: every undirected edge must be used by exactly two directed
+/// faces, and the two uses must traverse it in opposite directions.
+///
+/// The witness is the lexicographically smallest faulty undirected edge
+/// (ordered by smaller endpoint id, then larger).
+pub fn audit_edges(mesh: &Mesh) -> Result<(), EdgeFailure> {
+    audit_edges_mode(mesh, AuditMode::Closed)
+}
+
+/// Stage 1 with an explicit mode. In [`AuditMode::Boundary`], an edge used
+/// by exactly one directed face is legal; same-direction pairs and three or
+/// more uses still fail with the original edge-level priority.
+fn audit_edges_mode(mesh: &Mesh, mode: AuditMode) -> Result<(), EdgeFailure> {
+    for ((a, b), dirs) in edge_uses(mesh) {
         let uses = dirs[0] + dirs[1];
         let fault = if uses == 1 {
+            if mode == AuditMode::Boundary {
+                continue; // legal hole edge
+            }
             EdgeFault::Boundary
         } else if uses == 2 && dirs[0] == 1 && dirs[1] == 1 {
             continue; // exactly one use in each direction
@@ -297,13 +355,27 @@ pub fn audit_edges(mesh: &Mesh) -> Result<(), EdgeFailure> {
 /// edge glue the matching link endpoints; the link therefore decomposes
 /// into disjoint cycles, one cycle per surface sector ("fan") at `v`.
 pub fn audit_vertex_sectors(mesh: &Mesh) -> Result<(), (String, usize)> {
+    audit_vertex_sectors_mode(mesh, AuditMode::Closed)
+}
+
+/// Stage 2 with an explicit mode. In [`AuditMode::Boundary`] the single
+/// link component may also be a simple path (the vertex lies on one hole):
+/// a link component is accepted when every one of its nodes has in-degree
+/// and out-degree at most one and the component is either a directed cycle
+/// (one sector, interior vertex) or a directed path with exactly two degree-1
+/// ends (boundary vertex). Forks, two sectors and isolated vertices fail.
+fn audit_vertex_sectors_mode(mesh: &Mesh, mode: AuditMode) -> Result<(), (String, usize)> {
     // vertex -> (successor -> predecessor) adjacency of link edges.
     // After a passed edge stage every successor key is unique; a collision
     // (broken precondition) is handled by auditing the link as a general
     // directed graph below rather than by panicking.
-    let mut incident: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    let mut link: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    // Undirected version of the same link: vertex -> (node -> neighbours),
+    // for weak-component counting.
+    let mut adj: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
     for v in &mesh.vertices {
-        incident.insert(v.clone(), BTreeMap::new());
+        link.insert(v.clone(), BTreeMap::new());
+        adj.insert(v.clone(), BTreeMap::new());
     }
     for face in &mesh.faces {
         let corners = [(0usize, 1usize, 2usize), (1, 2, 0), (2, 0, 1)];
@@ -311,23 +383,29 @@ pub fn audit_vertex_sectors(mesh: &Mesh) -> Result<(), (String, usize)> {
             let v = &face[vi];
             let successor = &face[si];
             let predecessor = &face[pi];
-            incident
-                .get_mut(v)
+            link.get_mut(v)
                 .expect("vertex already registered")
                 .insert(successor.clone(), predecessor.clone());
+            let graph = adj.get_mut(v).expect("vertex already registered");
+            graph
+                .entry(successor.clone())
+                .or_default()
+                .insert(predecessor.clone());
+            graph
+                .entry(predecessor.clone())
+                .or_default()
+                .insert(successor.clone());
         }
     }
 
     for v in &mesh.vertices {
-        let link = &incident[v];
-        // Sector count = number of connected components of the link graph
-        // (edges connect each successor to its predecessor). For a fan it is
-        // one directed cycle; for a pinched vertex the link is two cycles.
-        let mut nodes: BTreeSet<String> = BTreeSet::new();
-        for (s, p) in link {
-            nodes.insert(s.clone());
-            nodes.insert(p.clone());
-        }
+        let link = &link[v];
+        // Weak connected components of the link graph (edges connect each
+        // successor to its predecessor). For a fan it is one directed
+        // cycle; for a pinched vertex the link is two cycles; for a
+        // boundary vertex it is one path.
+        let graph = &adj[v];
+        let nodes: BTreeSet<String> = graph.keys().cloned().collect();
         let mut visited: BTreeSet<String> = BTreeSet::new();
         let mut sectors = 0usize;
         for start in &nodes {
@@ -340,13 +418,43 @@ pub fn audit_vertex_sectors(mesh: &Mesh) -> Result<(), (String, usize)> {
                 if !visited.insert(cur.clone()) {
                     continue;
                 }
-                if let Some(next) = link.get(&cur) {
-                    stack.push(next.clone());
+                if let Some(neighbours) = graph.get(&cur) {
+                    for next in neighbours {
+                        stack.push(next.clone());
+                    }
                 }
             }
         }
         if sectors != 1 {
+            // Isolated declared vertex: no link nodes at all (zero sectors).
             return Err((v.clone(), sectors));
+        }
+
+        if mode == AuditMode::Boundary {
+            // The single component must be a simple path or a cycle: at most
+            // one outgoing and one incoming link edge per node …
+            let mut indegree: BTreeMap<String, usize> =
+                nodes.iter().map(|node| (node.clone(), 0)).collect();
+            for predecessor in link.values() {
+                *indegree.get_mut(predecessor).expect("link node present") += 1;
+            }
+            let mut degree_one_ends = 0usize;
+            for node in &nodes {
+                let out = if link.contains_key(node) { 1 } else { 0 };
+                let inn = indegree[node];
+                if out > 1 || inn > 1 {
+                    // Forked link (defense in depth; the edge stage already
+                    // excludes this for triangle meshes).
+                    return Err((v.clone(), sectors));
+                }
+                if out + inn == 1 {
+                    degree_one_ends += 1;
+                }
+            }
+            // … and a path has exactly two ends, a cycle none.
+            if degree_one_ends != 0 && degree_one_ends != 2 {
+                return Err((v.clone(), sectors));
+            }
         }
     }
     Ok(())
@@ -421,15 +529,27 @@ pub fn edge_count(mesh: &Mesh) -> usize {
 /// Run the full fixed-priority audit:
 /// parse → edges → vertex sectors → global connectivity → invariants.
 pub fn analyze(input: &str) -> Report {
+    analyze_mode(input, AuditMode::Closed)
+}
+
+/// Run the audit in [`AuditMode::Boundary`]: single-use edges are legal
+/// holes, vertex links may be simple paths, and a successful report carries
+/// the canonical boundary loops and the genus solved from
+/// χ = 2 − 2g − b.
+pub fn analyze_with_boundary(input: &str) -> Report {
+    analyze_mode(input, AuditMode::Boundary)
+}
+
+fn analyze_mode(input: &str, mode: AuditMode) -> Report {
     let mesh = match parse(input) {
         Ok(mesh) => mesh,
         Err(reject) => return Report::Rejected(reject),
     };
 
-    if let Err(failure) = audit_edges(&mesh) {
+    if let Err(failure) = audit_edges_mode(&mesh, mode) {
         return Report::EdgeFailed(failure);
     }
-    if let Err((id, sectors)) = audit_vertex_sectors(&mesh) {
+    if let Err((id, sectors)) = audit_vertex_sectors_mode(&mesh, mode) {
         return Report::VertexFailed { id, sectors };
     }
     if let Err(id) = audit_connected(&mesh) {
@@ -440,15 +560,168 @@ pub fn analyze(input: &str) -> Report {
     let f = mesh.faces.len();
     let e = edge_count(&mesh);
     let euler = v as i64 - e as i64 + f as i64;
-    // For a closed connected orientable surface: chi = 2 - 2g.
-    // Every passed audit yields 2g = 2 - chi >= 0; the clamp is pure
-    // defense in depth against an internal invariant violation.
-    let genus = (((2 - euler) / 2).max(0)) as u32;
-    Report::Ok {
-        vertices: v,
-        edges: e,
-        faces: f,
-        euler,
-        genus,
+
+    if mode == AuditMode::Closed {
+        // For a closed connected orientable surface: chi = 2 - 2g.
+        // Every passed audit yields 2g = 2 - chi >= 0; the clamp is pure
+        // defense in depth against an internal invariant violation.
+        let genus = (((2 - euler) / 2).max(0)) as u32;
+        return Report::Ok {
+            vertices: v,
+            edges: e,
+            faces: f,
+            euler,
+            genus,
+        };
+    }
+
+    // Boundary mode: the single-face edges induce the boundary loops. Their
+    // combinatorial integrity was established by the stages above; any
+    // inconsistency below means the identity cannot be trusted.
+    let boundary = match trace_boundary_loops(&mesh) {
+        Some(loops) => loops,
+        None => {
+            return Report::TopologyFailed {
+                vertices: v,
+                edges: e,
+                faces: f,
+                euler,
+                boundary_count: 0,
+            }
+        }
+    };
+    let b = boundary.len() as i64;
+
+    match boundary_genus(euler, b) {
+        Some(genus) => Report::BoundaryOk {
+            vertices: v,
+            edges: e,
+            faces: f,
+            euler,
+            genus,
+            boundary,
+        },
+        None => Report::TopologyFailed {
+            vertices: v,
+            edges: e,
+            faces: f,
+            euler,
+            boundary_count: boundary.len(),
+        },
+    }
+}
+
+/// Solve χ = 2 − 2g − b for a non-negative integer genus. Returns `None`
+/// unless 2 − b − χ is a non-negative even integer.
+fn boundary_genus(euler: i64, b: i64) -> Option<u32> {
+    let twice = 2 - b - euler;
+    if twice < 0 || twice % 2 != 0 {
+        return None;
+    }
+    let g = twice / 2;
+    u32::try_from(g).ok()
+}
+
+/// Trace the boundary loops induced by edges used by exactly one face.
+///
+/// A boundary edge is taken in the direction its sole face traverses it.
+/// After a passed boundary audit these directed edges partition into
+/// disjoint simple cycles (each boundary vertex link is one path, so each
+/// such vertex has exactly one outgoing and one incoming boundary edge).
+/// Each loop is rotated to begin at its smallest vertex id (traversal
+/// direction is never reversed), and the loops are sorted by first vertex.
+///
+/// `None` reports any structural surprise (a non-loop component, a repeated
+/// visit or a loop shorter than three edges); the caller then refuses the
+/// success verdict rather than publishing bad loops.
+fn trace_boundary_loops(mesh: &Mesh) -> Option<Vec<Vec<String>>> {
+    // directed boundary edge (u -> v) -> v
+    let mut outgoing: BTreeMap<String, String> = BTreeMap::new();
+    for ((a, b), dirs) in edge_uses(mesh) {
+        if dirs[0] + dirs[1] != 1 {
+            continue;
+        }
+        if dirs[0] == 1 {
+            outgoing.insert(a, b);
+        } else {
+            outgoing.insert(b, a);
+        }
+    }
+
+    let mut remaining: BTreeSet<(String, String)> = outgoing
+        .iter()
+        .map(|(u, v)| (u.clone(), v.clone()))
+        .collect();
+    let mut loops: Vec<Vec<String>> = Vec::new();
+
+    while let Some((start, _)) = remaining.iter().next().cloned() {
+        let mut cycle: Vec<String> = vec![start.clone()];
+        let mut cur = start.clone();
+        loop {
+            let next = outgoing.get(&cur)?.clone();
+            // The edge was already consumed in this or an earlier loop:
+            // the boundary edges do not form disjoint cycles.
+            if !remaining.remove(&(cur.clone(), next.clone())) {
+                return None;
+            }
+            if next == start {
+                break;
+            }
+            // Revisiting an interior vertex closes on the wrong point.
+            if cycle.contains(&next) {
+                return None;
+            }
+            cycle.push(next.clone());
+            cur = next;
+        }
+        if cycle.len() < 3 {
+            return None;
+        }
+
+        // Rotate so the smallest vertex id leads; the induced direction is
+        // preserved. It is unique because a simple loop has distinct ids.
+        let min_pos = cycle
+            .iter()
+            .enumerate()
+            .min_by(|(_, x), (_, y)| x.cmp(y))
+            .map(|(i, _)| i)?;
+        cycle.rotate_left(min_pos);
+        loops.push(cycle);
+    }
+
+    // Deterministic order: by leading vertex, then the full vertex sequence.
+    loops.sort();
+    Some(loops)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // chi = 2 - 2g - b  must yield a non-negative integer g; a failed solve
+    // is the caller's signal never to publish a success verdict.
+    #[test]
+    fn genus_identity_examples() {
+        assert_eq!(boundary_genus(2, 0), Some(0)); // sphere
+        assert_eq!(boundary_genus(0, 0), Some(1)); // torus
+        assert_eq!(boundary_genus(-2, 0), Some(2)); // genus 2
+        assert_eq!(boundary_genus(1, 1), Some(0)); // disc
+        assert_eq!(boundary_genus(0, 2), Some(0)); // annulus
+        assert_eq!(boundary_genus(-1, 1), Some(1)); // punctured torus
+        assert_eq!(boundary_genus(-3, 1), Some(2)); // twice-punctured genus-2
+    }
+
+    #[test]
+    fn genus_identity_rejects_impossible_values() {
+        assert_eq!(boundary_genus(3, 0), None); // chi > 2
+        assert_eq!(boundary_genus(1, 0), None); // 2 - chi odd
+        assert_eq!(boundary_genus(-1, 0), None); // closed, odd chi
+        assert_eq!(boundary_genus(-2, 1), None); // 3 - chi odd
+        assert_eq!(boundary_genus(2, 3), None); // negative genus
+    }
+
+    #[test]
+    fn mode_default_is_closed() {
+        assert_eq!(AuditMode::default(), AuditMode::Closed);
     }
 }

@@ -1,0 +1,19 @@
+# Triangulated annulus (boundary mode): outer rim a-b-c-d and inner rim
+# e-f-g-h joined by eight alternating triangles. Two boundary loops,
+# chi = 8 - 16 + 8 = 0, b = 2, so g = 0.
+v a
+v b
+v c
+v d
+v e
+v f
+v g
+v h
+f a b f
+f a f e
+f b c g
+f b g f
+f c d h
+f c h g
+f d a e
+f d e h

@@ -1,0 +1,20 @@
+# Broken aperture (boundary mode): a legal disc a-b-c-d-o with a small
+# triangular flap x-y-z attached only at rim vertex a. Every edge is
+# still paired or single, but the link of a has two sectors (a cycle-ish
+# fan plus the flap path), so the vertex stage must reject it before any
+# boundary loops are published.
+v a
+v b
+v c
+v d
+v o
+v x
+v y
+v z
+f o a b
+f o b c
+f o c d
+f o d a
+f a x y
+f a y z
+f a z x
